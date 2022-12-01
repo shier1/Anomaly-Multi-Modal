@@ -104,7 +104,7 @@ class AttentionLayer(nn.Module):
 
 
 class CrossAttentionLayer(nn.Module):
-    def __init__(self, attention, d_model, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+    def __init__(self, attention, d_model, num_heads=8, qkv_bias=False, attn_drop=0.):
         super().__init__()
         assert d_model % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
@@ -114,12 +114,10 @@ class CrossAttentionLayer(nn.Module):
         self.inner_attention = attention
         self.series_qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
         self.series_proj = nn.Linear(d_model, d_model)
-        self.series_proj_drop = nn.Dropout(proj_drop)
 
         self.freq_qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
         self.freq_attn_drop = nn.Dropout(attn_drop)
         self.freq_proj = nn.Linear(d_model, d_model)
-        self.freq_proj_drop = nn.Dropout(proj_drop)
 
         self.sigma_projection = nn.Linear(d_model,
                                           num_heads)
@@ -146,6 +144,6 @@ class CrossAttentionLayer(nn.Module):
         x_freq = (freq_attn @ freq_v).transpose(1, 2).reshape(B, N, C)
         x_series = x_series.view(B, N, -1)
         x_freq = x_freq.view(B, N, -1)
-        return self.series_proj_drop(self.series_proj(x_series)), \
-                self.freq_proj_drop(self.freq_proj(x_freq)),\
+        return self.series_proj(x_series), \
+                self.freq_proj(x_freq),\
                     series_asso, prior_asso, series_sigma

@@ -11,24 +11,39 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
         self.attention = attention
-        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
-        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.series_conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.series_conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.series_norm1 = nn.LayerNorm(d_model)
+        self.series_norm2 = nn.LayerNorm(d_model)
+        
+        self.freq_conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.freq_conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.freq_norm1 = nn.LayerNorm(d_model)
+        self.freq_norm2 = nn.LayerNorm(d_model)
+ 
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
 
     def forward(self, series_token, freq_token, attn_mask=None):
-        new_x, freq_token, attn, mask, sigma = self.attention(
+        new_series_token, new_freq_token, attn, mask, sigma = self.attention(
             freq_token, series_token, series_token,
             attn_mask=attn_mask
         )
-        x = series_token + self.dropout(new_x)
-        y = x = self.norm1(x)
-        y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
-        y = self.dropout(self.conv2(y).transpose(-1, 1))
+        new_series = series_token + self.dropout(new_series_token)
+        new_freq_token = freq_token + self.dropout(new_freq_token)
+        new_series_token = self.series_norm1(new_series_token)
+        new_freq_token = self.freq_norm1(new_freq_token)
 
-        return self.norm2(x + y), freq_token, attn, mask, sigma
+        series_identity = new_series_token
+        freq_identity = new_freq_token
+
+        new_series_token = self.dropout(self.activation(self.series_conv1(new_series_token.transpose(-1, 1))))
+        new_series_token = self.dropout(self.series_conv2(new_series_token).transpose(-1, 1))
+
+        new_freq_token = self.dropout(self.activation(self.freq_conv1(new_freq_token.transpose(-1, 1))))
+        new_freq_token = self.dropout(self.freq_conv2(new_freq_token).transpose(-1, 1))
+
+        return self.series_norm2(new_series_token + series_identity), self.freq_norm2(new_freq_token+freq_identity), attn, mask, sigma
 
 
 class Encoder(nn.Module):
@@ -70,17 +85,17 @@ class SeriesConvs(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
 
     def forward(self, x):
-        x = x.permute([0, 2, 1])
+        x = x.permute([0, 2, 1]).contiguous()
         identity = x
         conv1x = self.conv1x(x)
         conv3x = self.conv3x(x)
         conv7x = self.conv7x(x)
         max_f = self.maxpool(x)
         avg_f = self.avgpool(x)
-        pool_f = torch.concat([max_f, avg_f], dim=-1)
-        series_features = torch.concat([identity, conv1x, conv3x, conv7x, pool_f], dim=-2)
+        pool_f = torch.cat([max_f, avg_f], dim=-1)
+        series_features = torch.cat([identity, conv1x, conv3x, conv7x, pool_f], dim=-2)
         out = self.conv_proj(series_features)
-        out = out.permute([0, 2, 1])
+        out = out.permute([0, 2, 1]).contiguous()
         return out
 
 
@@ -109,9 +124,9 @@ class SpatialConvs(nn.Module):
         conv7x = self.conv7x(x)
         max_f = self.maxpool(x)
         avg_f = self.avgpool(x)
-        pool_f = torch.concat([max_f, avg_f], dim=-1)
+        pool_f = torch.cat([max_f, avg_f], dim=-1)
         pool_f = self.fc(pool_f)
-        spatial_features = torch.concat([identity, conv1x, conv3x, conv7x, pool_f], dim=-2)
+        spatial_features = torch.cat([identity, conv1x, conv3x, conv7x, pool_f], dim=-2)
         out = self.conv_proj(spatial_features)
         return out
 
@@ -122,8 +137,8 @@ class Block(nn.Module):
         self.series_conv = SeriesConvs(enc_in, d_model)
     
     def forward(self, x):
-        spatial_features = self.spatial_conv(x)
-        series_features = self.series_conv(spatial_features)
+        # spatial_features = self.spatial_conv(x)
+        series_features = self.series_conv(x)
         return series_features
 
 

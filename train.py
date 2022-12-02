@@ -74,7 +74,7 @@ def test(args, model):
         input_data_freq = input_data_freq.float().to(args.device)
 
         output, series, prior, _ = model(input_data_series, input_data_freq)
-        loss = torch.mean(criterion(input, output), dim=-1)
+        loss = torch.mean(criterion(input_data_series, output), dim=-1)
 
         series_loss = 0.0
         prior_loss = 0.0
@@ -109,7 +109,7 @@ def test(args, model):
         input_data_freq = input_data_freq.float().to(args.device)
 
         output, series, prior, _ = model(input_data_series, input_data_freq)
-        loss = torch.mean(criterion(input, output), dim=-1)
+        loss = torch.mean(criterion(input_data_series, output), dim=-1)
         series_loss = 0.0
         prior_loss = 0.0
         for u in range(len(prior)):
@@ -148,7 +148,7 @@ def test(args, model):
         input_data_freq = input_data_freq.float().to(args.device)
 
         output, series, prior, _ = model(input_data_series, input_data_freq)
-        loss = torch.mean(criterion(input, output), dim=-1)
+        loss = torch.mean(criterion(input_data_series, output), dim=-1)
         series_loss = 0.0
         prior_loss = 0.0
         for u in range(len(prior)):
@@ -259,7 +259,7 @@ def valid(args, model, val_loader, criterion):
                                                                                                     args.win_size)))))
             series_loss = series_loss / len(prior)
             prior_loss = prior_loss / len(prior)
-            rec_loss = criterion(output, input)
+            rec_loss = criterion(output, input_data_series)
             loss_1.append((rec_loss - args.k * series_loss).item())
             loss_2.append((rec_loss + args.k * prior_loss).item())
     return np.average(loss_1), np.average(loss_2)
@@ -341,7 +341,7 @@ def train(args, model):
                                                                                                     args.win_size)))))
             series_loss = series_loss / len(prior)
             prior_loss = prior_loss / len(prior)
-            rec_loss = criterion(output, input)
+            rec_loss = criterion(output, input_data_series)
 
             loss1 = rec_loss - args.k * series_loss
             loss2 = rec_loss + args.k * prior_loss

@@ -144,6 +144,7 @@ class CrossAttentionLayer(nn.Module):
         x_freq = (freq_attn @ freq_v).transpose(1, 2).reshape(B, N, C)
         x_series = x_series.view(B, N, -1)
         x_freq = x_freq.view(B, N, -1)
+        
         return self.series_proj(x_series), \
                 self.freq_proj(x_freq),\
                     series_asso, prior_asso, series_sigma

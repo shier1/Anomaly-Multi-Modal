@@ -1,5 +1,5 @@
-export CUDA_VISIBLE_DEVICES=3
-batchsize=64
+export CUDA_VISIBLE_DEVICES=0
+batchsize=16
 
 python main.py --anormly_ratio 0.5 --num_epochs 10   --batch_size $batchsize  --mode train --dataset SMD  --data_path dataset/SMD   --input_c 38
 python main.py --anormly_ratio 0.5 --num_epochs 10   --batch_size $batchsize     --mode test    --dataset SMD   --data_path dataset/SMD     --input_c 38     --pretrained_model 20

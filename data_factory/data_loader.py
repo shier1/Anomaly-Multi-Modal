@@ -251,3 +251,32 @@ def get_loader_segment(data_path, batch_size, win_size=100, step=100, mode='trai
                              shuffle=shuffle,
                              num_workers=0)
     return data_loader
+
+
+def get_loader_dist(args, step=100, mode='train'):
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+
+    if (args.dataset == 'SMD'):
+        dataset = SMDSegLoader(args.data_path, args.win_size, step, mode)
+    elif (args.dataset == 'MSL'):
+        dataset = MSLSegLoader(args.data_path, args.win_size, 1, mode)
+    elif (args.dataset == 'SMAP'):
+        dataset = SMAPSegLoader(args.data_path, args.win_size, 1, mode)
+    elif (args.dataset == 'PSM'):
+        dataset = PSMSegLoader(args.data_path, args.win_size, 1, mode)
+
+    if args.local_rank == 0:
+        torch.distributed.barrier()
+
+    if mode == 'train':
+        sampler = RandomSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset)
+    else:
+        sampler = SequentialSampler(dataset)
+
+    dataloader = DataLoader(dataset,
+                            sampler=sampler,
+                            batch_size=args.batch_size,
+                            num_workers=4,
+                            pin_memory=True)
+    return dataloader

@@ -1,80 +1,37 @@
 # coding=utf-8
 from __future__ import absolute_import, division, print_function
-
+import time
 import logging
 import argparse
 import os
 import random
 import numpy as np
-
 from datetime import timedelta
 
 import torch
-import torch.distributed as dist
-
-from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
+# from apex import amp
+# from apex.parallel import DistributedDataParallel as DDP
+from torch import amp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils.utils import *
+from utils.lr_scheduler import adjust_learning_rate
 from model.AnomalyTransformer import AnomalyTransformer
-from data_factory.data_loader import get_loader_segment
+from data_factory.data_loader import get_loader_segment, get_loader_dist
 
 
 logger = logging.getLogger(__name__)
 
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-def simple_accuracy(preds, labels):
-    return (preds == labels).mean()
-
-
-def save_model(args, model):
-    model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
-    torch.save(model_to_save.state_dict(), model_checkpoint)
-    logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
-
-def save_min_loss(args, model):
-    model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(args.output_dir, "min_loss_model.bin")
-    torch.save(model_to_save.state_dict(), model_checkpoint)
-    logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
-
-def save_last(args, model):
-    model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(args.output_dir, "last.bin")
-    torch.save(model_to_save.state_dict(), model_checkpoint)
-    logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
-
-
 def setup(args):
     # Prepare model
-    model = get_model()
+    model = AnomalyTransformer(win_size=args.win_size, enc_in=args.input_c, c_out=args.output_c, e_layers=3)
     model.to(args.device)
     num_params = count_parameters(model)
 
     logger.info("Training parameters %s", args)
     logger.info("Total Parameter: \t%2.1fM" % num_params)
-    print(num_params)
+    logger.info(num_params)
     return args, model
 
 
@@ -91,61 +48,221 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, val_loader, global_step, loss_fct):
-    # Validation!
-    """
-    训练进度可视化
-    返回训练后的Acc与loss
-    """
-    eval_losses = AverageMeter()
+def test(args, model):
+    # Distributed training
+    if args.local_rank != -1:
+        # model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        model = DDP(model, find_unused_parameters=True, device_ids=[args.local_rank], output_device=args.local_rank)
 
-    logger.info("***** Running Validation *****")
-    logger.info("  Num steps = %d", len(val_loader))
-    logger.info("  Batch size = %d", args.eval_batch_size)
+    model.load_state_dict(
+            torch.load(
+                os.path.join(str(args.output_dir), str(args.dataset) + '_checkpoint.pth')))
 
     model.eval()
-    all_preds, all_label = [], []
-    epoch_iterator = tqdm(val_loader,
-                          desc="Validating... (loss=X.X)",
-                          bar_format="{l_bar}{r_bar}",
-                          dynamic_ncols=True,
-                          disable=args.local_rank not in [-1, 0])
+    temperature = 50
+    criterion = nn.MSELoss(reduction='none')
+    attens_energy = []
+    train_loader = get_loader_dist(args=args, mode='train')
+    thre_loader = get_loader_dist(args=args, mode='thre')
 
-    for step, batch in enumerate(epoch_iterator):
-        batch = tuple(t.to(args.device) for t in batch)
-        x, y = batch
+    logger.info("***** Running testing *****")
+    logger.info("  Num steps = %d", len(thre_loader))
+    logger.info("  Batch size = %d", args.batch_size)
+
+    for i, (input_data_series, input_data_freq, labels) in enumerate(train_loader):
+        input_data_series = input_data_series.float().to(args.device)
+        input_data_freq = input_data_freq.float().to(args.device)
+
+        output, series, prior, _ = model(input_data_series, input_data_freq)
+        loss = torch.mean(criterion(input, output), dim=-1)
+
+        series_loss = 0.0
+        prior_loss = 0.0
+        for u in range(len(prior)):
+            if u == 0:
+                series_loss = my_kl_loss(series[u], (
+                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                args.win_size)).detach()) * temperature
+                prior_loss = my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)),
+                    series[u].detach()) * temperature
+            else:
+                series_loss += my_kl_loss(series[u], (
+                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                args.win_size)).detach()) * temperature
+                prior_loss += my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)),
+                    series[u].detach()) * temperature
+        metric = torch.softmax((-series_loss - prior_loss), dim=-1)
+        cri = metric * loss
+        cri = cri.detach().cpu().numpy()
+        attens_energy.append(cri)
+    
+    attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
+    train_energy = np.array(attens_energy)
+    
+    attens_energy = []
+    for i, (input_data_series, input_data_freq, labels) in enumerate(thre_loader):
+        input_data_series = input_data_series.float().to(args.device)
+        input_data_freq = input_data_freq.float().to(args.device)
+
+        output, series, prior, _ = model(input_data_series, input_data_freq)
+        loss = torch.mean(criterion(input, output), dim=-1)
+        series_loss = 0.0
+        prior_loss = 0.0
+        for u in range(len(prior)):
+            if u == 0:
+                series_loss = my_kl_loss(series[u], (
+                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                args.win_size)).detach()) * temperature
+                prior_loss = my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)),
+                    series[u].detach()) * temperature
+            else:
+                series_loss += my_kl_loss(series[u], (
+                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                args.win_size)).detach()) * temperature
+                prior_loss += my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)),
+                    series[u].detach()) * temperature
+
+        metric = torch.softmax((-series_loss - prior_loss), dim=-1)
+        cri = metric * loss
+        cri = cri.detach().cpu().numpy()
+        attens_energy.append(cri)
+
+    attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
+    test_energy = np.array(attens_energy)
+    combined_energy = np.concatenate([train_energy, test_energy], axis=0)
+    thresh = np.percentile(combined_energy, 100 - args.anormly_ratio)
+    logger.info(f"Threshold :{thresh}")
+    
+    test_labels = []
+    attens_energy = []
+    for i, (input_data_series, input_data_freq, labels) in enumerate(thre_loader):
+        input_data_series = input_data_series.float().to(args.device)
+        input_data_freq = input_data_freq.float().to(args.device)
+
+        output, series, prior, _ = model(input_data_series, input_data_freq)
+        loss = torch.mean(criterion(input, output), dim=-1)
+        series_loss = 0.0
+        prior_loss = 0.0
+        for u in range(len(prior)):
+            if u == 0:
+                series_loss = my_kl_loss(series[u], (
+                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                args.win_size)).detach()) * temperature
+                prior_loss = my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)),
+                    series[u].detach()) * temperature
+            else:
+                series_loss += my_kl_loss(series[u], (
+                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                args.win_size)).detach()) * temperature
+                prior_loss += my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)),
+                    series[u].detach()) * temperature
+
+        metric = torch.softmax((-series_loss - prior_loss), dim=-1)
+        cri = metric * loss
+        cri = cri.detach().cpu().numpy()
+        attens_energy.append(cri)
+        test_labels.append(labels)
+        
+    attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
+    test_labels = np.concatenate(test_labels, axis=0).reshape(-1)
+    test_energy = np.array(attens_energy)
+    test_labels = np.array(test_labels)
+
+    pred = (test_energy > thresh).astype(int)
+    gt = test_labels.astype(int)
+    
+    logger.info(f"pred:   {pred.shape}")
+    logger.info(f"gt:     {gt.shape}")
+    
+    anomaly_state = False
+    for i in range(len(gt)):
+        if gt[i] == 1 and pred[i] == 1 and not anomaly_state:
+            anomaly_state = True
+            for j in range(i, 0, -1):
+                if gt[j] == 0:
+                    break
+                else:
+                    if pred[j] == 0:
+                        pred[j] = 1
+            for j in range(i, len(gt)):
+                if gt[j] == 0:
+                    break
+                else:
+                    if pred[j] == 0:
+                        pred[j] = 1
+        elif gt[i] == 0:
+            anomaly_state = False
+        if anomaly_state:
+            pred[i] = 1
+
+    pred = np.array(pred)
+    gt = np.array(gt)
+    
+    logger.info(f"pred: {pred.shape}")
+    logger.info(f"gt:   {gt.shape}")
+    
+    from sklearn.metrics import precision_recall_fscore_support
+    from sklearn.metrics import accuracy_score
+    
+    accuracy = accuracy_score(gt, pred)
+    precision, recall, f_score, support = precision_recall_fscore_support(gt, pred,
+                                                                              average='binary')
+    logger.info(
+            "Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
+                accuracy, precision,
+                recall, f_score))
+    return accuracy, precision, recall, f_score
+
+
+def valid(args, model, val_loader, criterion):
+    logger.info("***** Running Validation *****")
+    logger.info("  Num steps = %d", len(val_loader))
+    logger.info("  Batch size = %d", args.batch_size)
+
+    model.eval()
+    loss_1 = []
+    loss_2 = []
+    for i, (input_data_series, input_data_freq, _) in enumerate(val_loader):
+        input_data_series = input_data_series.float().to(args.device)
+        input_data_freq = input_data_freq.float().to(args.device)
+
         with torch.no_grad():
-            logits = model(x)
-
-            eval_loss = loss_fct(logits, y)
-            eval_losses.update(eval_loss.item())
-
-            preds = torch.argmax(logits, dim=-1)
-
-        if len(all_preds) == 0:
-            all_preds.append(preds.detach().cpu().numpy())
-            all_label.append(y.detach().cpu().numpy())
-        else:
-            all_preds[0] = np.append(
-                all_preds[0], preds.detach().cpu().numpy(), axis=0
-            )
-            all_label[0] = np.append(
-                all_label[0], y.detach().cpu().numpy(), axis=0
-            )
-        epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
-
-    all_preds, all_label = all_preds[0], all_label[0]
-    accuracy = simple_accuracy(all_preds, all_label)
-
-    logger.info("\n")
-    logger.info("Validation Results")
-    logger.info("Global Steps: %d" % global_step)
-    logger.info("Valid Loss: %2.5f" % eval_losses.avg)
-    logger.info("Valid Accuracy: %2.5f" % accuracy)
-
-    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
-    return accuracy, eval_losses.avg
-
+            output, series, prior, _ = model(input_data_series, input_data_freq)
+        series_loss = 0.0
+        prior_loss = 0.0
+        for u in range(len(prior)):
+            series_loss += (torch.mean(my_kl_loss(series[u], (
+                    prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)).detach())) + torch.mean(
+                my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)).detach(),
+                    series[u])))
+            prior_loss += (torch.mean(
+                my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                    args.win_size)),
+                            series[u].detach())) + torch.mean(
+                my_kl_loss(series[u].detach(),
+                            (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                    args.win_size)))))
+            series_loss = series_loss / len(prior)
+            prior_loss = prior_loss / len(prior)
+            rec_loss = criterion(output, input)
+            loss_1.append((rec_loss - args.k * series_loss).item())
+            loss_2.append((rec_loss + args.k * prior_loss).item())
+    return np.average(loss_1), np.average(loss_2)
 
 def train(args, model):
     """ Train the model """
@@ -153,21 +270,18 @@ def train(args, model):
         os.makedirs(args.output_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
 
-    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+    args.batch_size = args.batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
-    train_loader, val_loader = get_loader(args)
+    train_loader = get_loader_dist(args=args, mode='train')
+    test_loader = get_loader_dist(args=args, mode='test')
 
     # Prepare optimizer and scheduler
-    optimizer = torch.optim.SGD(model.parameters(),
-                                lr=args.learning_rate,
-                                momentum=0.9,
-                                weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(),
+                                lr=args.learning_rate)
+    criterion = nn.MSELoss()
+
     t_total = args.num_steps
-    if args.decay_type == "cosine":
-        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
-    else:
-        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
     if args.fp16:
         model, optimizer = amp.initialize(models=model,
@@ -175,103 +289,115 @@ def train(args, model):
                                           opt_level=args.fp16_opt_level)
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    # loss_fct = torch.nn.CrossEntropyLoss(torch.tensor([1.2, 6.1], device=args.device))
-    # loss_fct = FocalLoss(2, 0.75)
-    loss_fct = CostSensitiveCE(1, [23735, 4654], args.device)
-
     # Distributed training
     if args.local_rank != -1:
-        model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        # model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        model = DDP(model, find_unused_parameters=True, device_ids=[args.local_rank], output_device=args.local_rank)
 
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Total optimization steps = %d", args.num_steps)
-    logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
+    logger.info("  Instantaneous batch size per GPU = %d", args.batch_size)
     logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                args.train_batch_size * args.gradient_accumulation_steps * (
+                args.batch_size * args.gradient_accumulation_steps * (
                     torch.distributed.get_world_size() if args.local_rank != -1 else 1))
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
 
     model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
+
+    early_stopping = EarlyStopping(patience=3, verbose=True, dataset_name=args.dataset)
     losses = AverageMeter()
-    global_step, best_acc = 0, 0
-    min_loss = 1000000
-    while True:
+    time_now = time.time()
+    
+    for epoch in range(t_total):
+        iter_count = 0
+
+        epoch_time = time.time()
         model.train()
-        epoch_iterator = tqdm(train_loader,
-                              desc="Training (X / X Steps) (loss=X.X)",
-                              bar_format="{l_bar}{r_bar}",
-                              dynamic_ncols=True,
-                              disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            if global_step <= args.mixup_epochs:
-                x, y = batch
-                l = np.random.beta(1, 1)
-                idx = torch.randperm(x.size(0))
+        for i, (input_data_series, input_data_freq, labels) in enumerate(train_loader):
+            optimizer.zero_grad()
+            iter_count += 1
+            input_data_series = input_data_series.float().to(args.device)
+            input_data_freq = input_data_freq.float().to(args.device)
 
-                x_a, x_b = x, x[idx]
-                y_a, y_b = y, y[idx]
-                mixed_x = l * x_a + (1-l) * x_b
+            output, series, prior, _ = model(input_data_series, input_data_freq)
+            # calculate Association discrepancy
+            series_loss = 0.0
+            prior_loss = 0.0
+            for u in range(len(prior)):
+                series_loss += (torch.mean(my_kl_loss(series[u], (
+                        prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                args.win_size)).detach())) + torch.mean(
+                    my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                        args.win_size)).detach(),
+                                series[u])))
+                prior_loss += (torch.mean(my_kl_loss(
+                    (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                            args.win_size)),
+                    series[u].detach())) + torch.mean(
+                    my_kl_loss(series[u].detach(), (
+                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+                                                                                                    args.win_size)))))
+            series_loss = series_loss / len(prior)
+            prior_loss = prior_loss / len(prior)
+            rec_loss = criterion(output, input)
 
-                mixed_x = mixed_x.to(args.device)
-                y_a = y_a.to(args.device)
-                y_b = y_b.to(args.device)
+            loss1 = rec_loss - args.k * series_loss
+            loss2 = rec_loss + args.k * prior_loss
 
-                out = model(mixed_x)
-                loss = l * loss_fct(out, y_a) + (1 - l)*loss_fct(out, y_b)
-            else:
-                batch = tuple(t.to(args.device) for t in batch)
-                x, y = batch
-                out = model(x)
-                loss = loss_fct(out, y)
+            if (i + 1) % 100 == 0:
+                speed = (time.time() - time_now) / iter_count
+                left_time = speed * ((t_total - epoch) * len(train_loader) - i)
+                logger.info('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                iter_count = 0
+                time_now = time.time()
 
             if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+                loss1 = loss1 / args.gradient_accumulation_steps
+                loss2 = loss2 / args.gradient_accumulation_steps
+            
             if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                with amp.scale_loss(loss1, optimizer) as scaled_loss:
+                    scaled_loss.backward(retain_graph=True)
+                with amp.scale_loss(loss2, optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
-                loss.backward()
-
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                losses.update(loss.item()*args.gradient_accumulation_steps)
+                loss1.backward(retain_graph=True)
+                loss2.backward()
+            
+            if (i + 1) % args.gradient_accumulation_steps == 0:
+                losses.update(loss1.item()*args.gradient_accumulation_steps)
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step()
-                global_step += 1
 
-                epoch_iterator.set_description(
-                    "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
-                )
-                if args.local_rank in [-1, 0]:
-                    writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
-                    writer.add_scalar("train/lr", scalar_value=scheduler.get_last_lr()[0], global_step=global_step)
-                if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy, val_loss = valid(args, model, writer, val_loader, global_step, loss_fct)
-                    if best_acc <= accuracy:
-                        save_model(args, model)
-                        best_acc = accuracy
-                    if val_loss <= min_loss:
-                        save_min_loss(args, model)
-                        min_loss = val_loss
-                    model.train()
 
-                if global_step % t_total == 0:
-                    break
+        logger.info("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+        train_loss = losses.avg
         losses.reset()
-        if global_step % t_total == 0:
+        if args.local_rank in [-1, 0]:
+            writer.add_scalar("train/loss", scalar_value=train_loss, global_step=epoch)
+
+        vali_loss1, vali_loss2 = valid(args, model, val_loader=test_loader, criterion=criterion)
+        if args.local_rank in [-1, 0]:
+            writer.add_scalar("val/loss1", scalar_value=vali_loss1, global_step=epoch)
+            writer.add_scalar("val/loss2", scalar_value=vali_loss2, global_step=epoch)
+
+        logger.info("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
+                    epoch + 1, len(train_loader), train_loss, vali_loss1))
+
+        early_stopping(vali_loss1, vali_loss2, model, args.output_dir)
+        if early_stopping.early_stop:
+            logger.info("Early stopping")
             break
+        adjust_learning_rate(optimizer, epoch + 1, args.learning_rate)
 
     if args.local_rank in [-1, 0]:
         writer.close()
-    logger.info("Best Accuracy: \t%f" % best_acc)
-    logger.info("End Training!")
-    save_last(args, model)
+
 
 
 def main():
@@ -280,28 +406,27 @@ def main():
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
 
-    parser.add_argument("--output_dir", default="output", type=str,
+    parser.add_argument("--output_dir", default="checkpoint", type=str,
                         help="The output directory where checkpoints will be written.")
 
-    parser.add_argument("--train_batch_size", default=512, type=int,
+    parser.add_argument("--batch_size", default=512, type=int,
                         help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", default=64, type=int,
-                        help="Total batch size for eval.")
-    parser.add_argument("--eval_every", default=100, type=int,
-                        help="Run prediction on validation set every so many steps."
-                             "Will always run one evaluation at the end of training.")
 
-    parser.add_argument("--learning_rate", default=3e-2, type=float,
+    parser.add_argument("--learning_rate", default=1e-4, type=float,
                         help="The initial learning rate for SGD.")
-    parser.add_argument("--weight_decay", default=0, type=float,
-                        help="Weight deay if we apply some.")
 
     parser.add_argument("--num_steps", default=1000, type=int,
                         help="Total number of training epochs to perform.")
-    parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
-                        help="How to decay the learning rate.")
-    parser.add_argument("--warmup_steps", default=50, type=int,
-                        help="Step of training to perform learning rate warmup for.")
+    parser.add_argument('--k', type=int, default=3)
+    parser.add_argument('--win_size', type=int, default=100)
+    parser.add_argument('--input_c', type=int, default=38)
+    parser.add_argument('--output_c', type=int, default=38)
+    parser.add_argument('--dataset', type=str, default='credit')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
+    parser.add_argument('--data_path', type=str, default='./dataset/creditcard_ts.csv')
+    parser.add_argument('--anormly_ratio', type=float, default=4.00)
+
+
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
 
@@ -312,18 +437,14 @@ def main():
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
 
-    parser.add_argument('--mixup_epochs', type=int, default=0, help='the mixup epoch in train')
-
     parser.add_argument('--fp16', action='store_true',
                         help="Whether to use 16-bit float precision instead of 32-bit")
     parser.add_argument('--fp16_opt_level', type=str, default='O2',
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
-    parser.add_argument('--loss_scale', type=float, default=0,
-                        help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
-                             "0 (default value): dynamic loss scaling.\n"
-                             "Positive power of 2: static loss scaling value.\n")
     args = parser.parse_args()
+
+    # args.local_rank = int(os.environ["LOCAL_RANK"])
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:
@@ -351,9 +472,10 @@ def main():
     args, model = setup(args)
 
     # Training
-    train(args, model)
-
+    if args.mode == 'train':
+        train(args, model)
+    else:
+        test(args, model)
 
 if __name__ == "__main__":
     main()
-

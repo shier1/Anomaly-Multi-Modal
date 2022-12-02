@@ -29,8 +29,9 @@ class EncoderLayer(nn.Module):
             freq_token, series_token, series_token,
             attn_mask=attn_mask
         )
-        new_series = series_token + self.dropout(new_series_token)
+        new_series_token = series_token + self.dropout(new_series_token)
         new_freq_token = freq_token + self.dropout(new_freq_token)
+        
         new_series_token = self.series_norm1(new_series_token)
         new_freq_token = self.freq_norm1(new_freq_token)
 

@@ -1,3 +1,4 @@
+import os
 import pywt
 import torch
 import numpy as np
@@ -233,6 +234,26 @@ class SMDSegLoader(object):
             data_freq = abs(np.fft.fft(data_series))
             return data_series, data_freq, data_label
 
+
+class SKABSegLoader(object):
+    def __init__(self, data_path, win_size, step, mode='train'):
+        self.mode = mode
+        self.win_size = win_size
+        self.step = step
+        self.scaler = StandardScaler()
+        all_files=[]
+        for root, dirs, files in os.walk(data_path):
+            for file in files:
+                if file.endswith(".csv"):
+                    all_files.append(os.path.join(root, file))
+        
+        for file in all_files:
+            if 'anomaly-free' not in file:
+                df = pd.read_csv(file, sep=';', index_col='datetime', parse_dates=True)
+                features = df.drop(['anomaly', 'changepoint'], axis=1)
+                label = df['anomaly']
+                
+
 def get_loader_segment(data_path, batch_size, win_size=100, step=100, mode='train', dataset='KDD'):
     if (dataset == 'SMD'):
         dataset = SMDSegLoader(data_path, win_size, step, mode)
@@ -281,3 +302,7 @@ def get_loader_dist(args, step=100, mode='train'):
                             num_workers=4,
                             pin_memory=True)
     return dataloader
+
+
+if __name__ == "__main__":
+    SKAB_loader = SKABSegLoader(data_path='dataset/SKAB/data', win_size=100, step=1, mode='train')

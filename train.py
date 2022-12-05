@@ -14,16 +14,15 @@ from torch.utils.tensorboard import SummaryWriter
 # from apex.parallel import DistributedDataParallel as DDP
 from torch import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.backends import cudnn
 
+from utils.log import Logger
 from utils.utils import *
 from utils.lr_scheduler import adjust_learning_rate
 from model.AnomalyTransformer import AnomalyTransformer
 from data_factory.data_loader import get_loader_segment, get_loader_dist
 
-
-logger = logging.getLogger(__name__)
-
-def setup(args):
+def setup(args, logger):
     # Prepare model
     model = AnomalyTransformer(win_size=args.win_size, enc_in=args.input_c, c_out=args.output_c, e_layers=3)
     model.to(args.device)
@@ -48,7 +47,7 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def test(args, model):
+def test(args, model, logger):
     # Distributed training
     if args.local_rank != -1:
         # model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
@@ -226,7 +225,7 @@ def test(args, model):
     return accuracy, precision, recall, f_score
 
 
-def valid(args, model, val_loader, criterion):
+def valid(args, model, val_loader, criterion, logger):
     logger.info("***** Running Validation *****")
     logger.info("  Num steps = %d", len(val_loader))
     logger.info("  Batch size = %d", args.batch_size)
@@ -264,7 +263,7 @@ def valid(args, model, val_loader, criterion):
             loss_2.append((rec_loss + args.k * prior_loss).item())
     return np.average(loss_1), np.average(loss_2)
 
-def train(args, model):
+def train(args, model, logger):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -381,7 +380,7 @@ def train(args, model):
         if args.local_rank in [-1, 0]:
             writer.add_scalar("train/loss", scalar_value=train_loss, global_step=epoch)
 
-        vali_loss1, vali_loss2 = valid(args, model, val_loader=test_loader, criterion=criterion)
+        vali_loss1, vali_loss2 = valid(args, model, val_loader=test_loader, criterion=criterion, logger = logger)
         if args.local_rank in [-1, 0]:
             writer.add_scalar("val/loss1", scalar_value=vali_loss1, global_step=epoch)
             writer.add_scalar("val/loss2", scalar_value=vali_loss2, global_step=epoch)
@@ -425,27 +424,22 @@ def main():
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
     parser.add_argument('--data_path', type=str, default='./dataset/creditcard_ts.csv')
     parser.add_argument('--anormly_ratio', type=float, default=4.00)
-
-
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
-
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
-
     parser.add_argument('--fp16', action='store_true',
                         help="Whether to use 16-bit float precision instead of 32-bit")
     parser.add_argument('--fp16_opt_level', type=str, default='O2',
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
     args = parser.parse_args()
-
     args.local_rank = int(os.environ["LOCAL_RANK"])
-
+    
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -457,13 +451,14 @@ def main():
                                              timeout=timedelta(minutes=60))
         args.n_gpu = 1
     args.device = device
-
+    cudnn.benchmark = True
+    logger = Logger().get_logger(args)
     # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S',
-                        filename='result.log',
-                        filemode='a',
-                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    # logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    #                     datefmt='%m/%d/%Y %H:%M:%S',
+    #                     filename='result.log',
+    #                     filemode='a',
+    #                     level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
                    (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
 
@@ -471,13 +466,13 @@ def main():
     set_seed(args)
 
     # Model & Tokenizer Setup
-    args, model = setup(args)
+    args, model = setup(args, logger)
 
     # Training
     if args.mode == 'train':
-        train(args, model)
+        train(args, model, logger)
     else:
-        test(args, model)
+        test(args, model, logger)
 
 if __name__ == "__main__":
     main()

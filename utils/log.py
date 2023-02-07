@@ -21,7 +21,7 @@ class Logger():
     
     def _get_file_handler(self, config):
         if not os.path.exists(config.output_dir):
-            os.makedirs(config.output_dir)
+            os.makedirs(config.output_dir, exist_ok=True)
         file_handler = logging.FileHandler(os.path.join(config.output_dir, 'trainer.log'))
         file_handler.setFormatter(self._get_formatter())
         file_handler.setLevel(level=self.Lever)

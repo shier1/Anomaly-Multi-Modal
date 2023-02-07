@@ -111,6 +111,7 @@ class CrossAttentionLayer(nn.Module):
 
         self.inner_attention = attention
         self.series_qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
+        self.series_drop = nn.Dropout(attn_drop)
         self.series_proj = nn.Linear(d_model, d_model)
 
         self.freq_qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
@@ -136,12 +137,18 @@ class CrossAttentionLayer(nn.Module):
             series_sigma,
             attn_mask
         )
-        freq_attn = (freq_q @ freq_k.transpose(-2, -1)) * self.scale
+        freq_attn = (series_q @ freq_k.transpose(-2, -1)) * self.scale
         freq_attn = freq_attn.softmax(dim=-1)
         freq_attn = self.freq_attn_drop(freq_attn)
         x_freq = (freq_attn @ freq_v).transpose(1, 2).reshape(B, N, C)
-        x_series = x_series.view(B, N, -1)
-        x_freq = x_freq.view(B, N, -1)
+
+        series_attn = (freq_q @ series_v.transpose(-2, -1)) * self.scale
+        series_attn = series_attn.softmax(dim=-1)
+        series_attn = self.series_drop(series_attn)
+        x_series = (series_attn @ series_v).transpose(-2, -1).reshape(B, N, C)
+
+        x_series = x_series.reshape(B, N, -1)
+        x_freq = x_freq.reshape(B, N, -1)
 
         return self.series_proj(x_series), \
                 self.freq_proj(x_freq), \

@@ -22,6 +22,7 @@ from utils.lr_scheduler import adjust_learning_rate
 from model.AnomalyTransformer import AnomalyTransformer
 from data_factory.data_loader import get_loader_segment, get_loader_dist
 
+
 def setup(args, logger):
     # Prepare model
     model = AnomalyTransformer(win_size=args.win_size, enc_in=args.input_c, c_out=args.output_c, e_layers=3)

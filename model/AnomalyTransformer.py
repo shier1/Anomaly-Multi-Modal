@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attn import AnomalyAttention, AttentionLayer, CrossAttentionLayer
+#from .attn import AnomalyAttention, AttentionLayer, CrossAttentionLayer
+from .attn_verison2 import AnomalyAttention, AttentionLayer, CrossAttentionLayer
 from .embed import DataEmbedding, TokenEmbedding, PositionalEmbedding
+from .series_spatial_block import Block
 
 
 class EncoderLayer(nn.Module):
@@ -31,7 +33,7 @@ class EncoderLayer(nn.Module):
         )
         new_series_token = series_token + self.dropout(new_series_token)
         new_freq_token = freq_token + self.dropout(new_freq_token)
-        
+
         new_series_token = self.series_norm1(new_series_token)
         new_freq_token = self.freq_norm1(new_freq_token)
 
@@ -59,88 +61,15 @@ class Encoder(nn.Module):
         prior_list = []
         sigma_list = []
         for attn_layer in self.attn_layers:
-            x, freq_token, series, prior, sigma = attn_layer(series_token, freq_token, attn_mask=attn_mask)
+            series_token, freq_token, series, prior, sigma = attn_layer(series_token, freq_token, attn_mask=attn_mask)
             series_list.append(series)
             prior_list.append(prior)
             sigma_list.append(sigma)
 
         if self.norm is not None:
-            x = self.norm(x)
+            series_token = self.norm(series_token)
 
-        return x, series_list, prior_list, sigma_list
-
-class SeriesConvs(nn.Module):
-    def __init__(self, enc_in, d_model):
-        super().__init__()
-        self.conv1x = nn.Conv1d(enc_in, d_model, kernel_size=1, padding=0, bias=False)
-        self.conv3x = nn.Conv1d(enc_in, d_model, kernel_size=3, padding=1, padding_mode='circular', bias=False)
-        self.conv7x = nn.Conv1d(enc_in, d_model, kernel_size=7, padding=3, padding_mode='circular', bias=False)
-        self.maxpool = nn.MaxPool1d(kernel_size=2)
-        self.avgpool = nn.AvgPool1d(kernel_size=2)
-        self.conv_proj = nn.Conv1d(enc_in*2+d_model*3, d_model, kernel_size=1, padding=0, bias=False)
-        self._init_weight()
-
-    def _init_weight(self,):
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
-
-    def forward(self, x):
-        x = x.permute([0, 2, 1]).contiguous()
-        identity = x
-        conv1x = self.conv1x(x)
-        conv3x = self.conv3x(x)
-        conv7x = self.conv7x(x)
-        max_f = self.maxpool(x)
-        avg_f = self.avgpool(x)
-        pool_f = torch.cat([max_f, avg_f], dim=-1)
-        series_features = torch.cat([identity, conv1x, conv3x, conv7x, pool_f], dim=-2)
-        out = self.conv_proj(series_features)
-        out = out.permute([0, 2, 1]).contiguous()
-        return out
-
-
-
-class SpatialConvs(nn.Module):
-    def __init__(self, win_size, num_features):
-        super().__init__()
-        self.conv1x = nn.Conv1d(win_size, win_size, kernel_size=1, padding=0, bias=False)
-        self.conv3x = nn.Conv1d(win_size, win_size, kernel_size=3, padding=1, padding_mode='circular', bias=False)
-        self.conv7x = nn.Conv1d(win_size, win_size, kernel_size=7, padding=3, padding_mode='circular', bias=False)
-        self.maxpool = nn.MaxPool1d(kernel_size=2)
-        self.avgpool = nn.AvgPool1d(kernel_size=2)
-        self.conv_proj = nn.Conv1d(win_size*5, win_size, kernel_size=1, padding=0, bias=False)
-        self.fc = nn.Linear(num_features//2*2, num_features)
-        self._init_weight()
-
-    def _init_weight(self,):
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
-
-    def forward(self, x):
-        identity = x
-        conv1x = self.conv1x(x)
-        conv3x = self.conv3x(x)
-        conv7x = self.conv7x(x)
-        max_f = self.maxpool(x)
-        avg_f = self.avgpool(x)
-        pool_f = torch.cat([max_f, avg_f], dim=-1)
-        pool_f = self.fc(pool_f)
-        spatial_features = torch.cat([identity, conv1x, conv3x, conv7x, pool_f], dim=-2)
-        out = self.conv_proj(spatial_features)
-        return out
-
-class Block(nn.Module):
-    def __init__(self, win_size, enc_in, d_model):
-        super().__init__()
-        self.spatial_conv = SpatialConvs(win_size, enc_in)
-        self.series_conv = SeriesConvs(enc_in, d_model)
-    
-    def forward(self, x):
-        # spatial_features = self.spatial_conv(x)
-        series_features = self.series_conv(x)
-        return series_features
+        return series_token, series_list, prior_list, sigma_list
 
 
 class AnomalyTransformer(nn.Module):
@@ -150,8 +79,11 @@ class AnomalyTransformer(nn.Module):
         self.output_attention = output_attention
 
         # Encoding
-        self.position_embeding = PositionalEmbedding(d_model)
-        self.shared_conv_block = self._make_share_block(win_size, enc_in, d_model, 3)
+        # self.position_embeding = PositionalEmbedding(d_model)
+        # self.embeding = TokenEmbedding(d_model, d_model)
+        self.series_embeding = DataEmbedding(enc_in, d_model)
+        self.freq_embeding = DataEmbedding(enc_in, d_model)
+        self.shared_conv_block = self._make_share_block(enc_in, 3)
         # Encoder
         self.encoder = Encoder(
             [
@@ -170,18 +102,17 @@ class AnomalyTransformer(nn.Module):
 
         self.projection = nn.Linear(d_model, c_out, bias=True)
 
-    def _make_share_block(self, win_size, enc_in, d_model, n):
-        first_block = Block(win_size=win_size, enc_in=enc_in, d_model=d_model)
-        layer_list = [first_block]
-        for i in range(n-1):
-            layer_list.append(Block(win_size, d_model, d_model))
+    def _make_share_block(self, enc_in, n):
+        layer_list = []
+        for i in range(n):
+            layer_list.append(Block(enc_in))
         return nn.Sequential(*layer_list)
 
     def forward(self, x_series, x_freq):
         x_series = self.shared_conv_block(x_series)
         x_freq = self.shared_conv_block(x_freq)
-        x_sereis_token = x_series + self.position_embeding(x_series)
-        x_freq_token = x_freq + self.position_embeding(x_freq)
+        x_sereis_token = self.series_embeding(x_series)
+        x_freq_token = self.freq_embeding(x_freq)
 
         enc_out, series, prior, sigmas = self.encoder(x_sereis_token, x_freq_token)
         enc_out = self.projection(enc_out)

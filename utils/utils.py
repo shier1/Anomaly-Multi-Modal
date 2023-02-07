@@ -1,9 +1,11 @@
 import os
+import numpy as np
+import random
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-import numpy as np
 
 
 def to_var(x, volatile=False):
@@ -25,7 +27,8 @@ def get_rank():
     return dist.get_rank()
 
 def get_world_size():
-    if not dist.is_available():#返回值是True或者Flase
+    # 返回值是True或者Flase
+    if not dist.is_available():
         return 1
     if not dist.is_initialized():
         return 1
@@ -69,9 +72,11 @@ class EarlyStopping:
             self.best_score = score
             self.best_score2 = score2
             self.save_checkpoint(val_loss, val_loss2, model, path)
-        elif score < self.best_score + self.delta or score2 < self.best_score2 + self.delta:
+        elif score < self.best_score + self.delta or score2 < self.best_score2\
+                + self.delta:
             self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            print(f'EarlyStopping counter: {self.counter}\
+                    out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
@@ -82,8 +87,10 @@ class EarlyStopping:
 
     def save_checkpoint(self, val_loss, val_loss2, model, path):
         if self.verbose:
-            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-        torch.save(model.state_dict(), os.path.join(path, str(self.dataset) + '_checkpoint.pth'))
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> \
+                    {val_loss:.6f}).  Saving model ...')
+        torch.save(model.state_dict(), os.path.join(path, str(self.dataset)
+                + '_checkpoint.pth'))
         self.val_loss_min = val_loss
         self.val_loss2_min = val_loss2
 
@@ -94,7 +101,10 @@ def my_kl_loss(p, q):
 
 
 class AverageMeter(object):
-    """Computes and stores the average and current value"""
+    """
+    Computes and stores the average and current value
+    """
+
     def __init__(self):
         self.reset()
 
@@ -109,3 +119,14 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+def seed_torch(seed=1029):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)  # 为了禁止hash随机化，使得实验可复现
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True

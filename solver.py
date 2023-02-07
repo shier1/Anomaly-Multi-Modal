@@ -98,7 +98,7 @@ class Solver(object):
                 iter_count += 1
                 input_data_series = input_data_series.float().to(self.device)
                 input_data_freq = input_data_freq.float().to(self.device)
-
+                # print(input_data_freq.shape, input_data_series.shape)
                 output, series, prior, _ = self.model(input_data_series, input_data_freq)
 
                 # calculate Association discrepancy

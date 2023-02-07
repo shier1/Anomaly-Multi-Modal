@@ -12,9 +12,9 @@ def str2bool(v):
 
 
 def main(config):
-    cudnn.benchmark = True
+    seed_torch()
     if (not os.path.exists(config.model_save_path)):
-        mkdir(config.model_save_path)
+        os.mkdir(config.model_save_path)
     solver = Solver(vars(config))
 
     if config.mode == 'train':
